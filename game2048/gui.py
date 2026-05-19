@@ -1,9 +1,17 @@
 import tkinter as tk
+from tkinter import messagebox
 from typing import Dict, Optional
 
 from .ai import HeuristicExpectimaxAI
-from .charts import ChartWindow
 from .core import Direction, Game2048
+
+# 嘗試匯入圖表模組；若 matplotlib 未安裝則優雅降級
+try:
+    from .charts import ChartWindow
+    _CHARTS_AVAILABLE = True
+except ImportError:
+    ChartWindow = None  # type: ignore
+    _CHARTS_AVAILABLE = False
 
 
 # 方塊顏色對應表（數值 → 背景色）
@@ -43,7 +51,7 @@ class GameGUI:
         self.delay_ms = tk.IntVar(value=200)  # AI 每步延遲（毫秒）
         self.ai_running = False
         self._fullscreen = False  # 真正全螢幕狀態（F11 切換）
-        self._chart_win: Optional[ChartWindow] = None  # 圖表視窗參考
+        self._chart_win: Optional["ChartWindow"] = None  # 圖表視窗參考
 
         self._build_ui()
         self._bind_keys()
@@ -98,8 +106,9 @@ class GameGUI:
         tk.Button(control_row, text="重新開始 (R)", command=self.restart_game).pack(side="left", padx=(0, 8))
 
         # 觀察圖表按鈕（開啟獨立圖表視窗）
+        chart_btn_color = "#e8f5e9" if _CHARTS_AVAILABLE else "#ffebee"
         tk.Button(control_row, text="觀察圖表 (C)", command=self.open_charts,
-                  bg="#e8f5e9", activebackground="#c8e6c9").pack(side="left")
+                  bg=chart_btn_color, activebackground="#c8e6c9").pack(side="left")
 
         # 右側 AI 資訊面板
         tk.Label(right, text="AI 資訊面板", font=("Arial", 12, "bold"), bg="#f3eee6").pack(anchor="w", padx=10, pady=(10, 8))
@@ -210,6 +219,15 @@ class GameGUI:
 
     def open_charts(self) -> None:
         """開啟或重新整理獨立圖表視窗（與遊戲視窗分開）"""
+        if not _CHARTS_AVAILABLE:
+            messagebox.showerror(
+                "缺少 matplotlib",
+                "圖表功能需要 matplotlib，請在命令列執行：\n\n"
+                "  pip install matplotlib\n\n"
+                "安裝後重新啟動遊戲即可使用圖表。"
+            )
+            return
+
         if self._chart_win is None or not self._chart_win.win.winfo_exists():
             # 圖表視窗不存在或已被關閉，重新建立
             self._chart_win = ChartWindow(self.root, self.ai)
