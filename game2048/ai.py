@@ -274,7 +274,7 @@ class HeuristicExpectimaxAI:
         - 最大值在左下角：給 log2(max_tile) 獎勵
         - 最大值在其他角落：給 -0.5*log2(max_tile) 懲罰
         - 最大值不在任何角落：給 -log2(max_tile) 重罰
-        corner 權重現為 1.5，避免過度守成而不願冒險合成更大磚。
+        corner 權重現為 1.2，避免過度守成而不願冒險合成更大磚。
         """
         if max_tile == 0:
             return 0.0
