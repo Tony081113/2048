@@ -15,7 +15,19 @@ DEFAULT_WEIGHTS = {
     "monotonicity": 1.0,
     "merge_potential": 1.5,
     "max_tile": 1.0,
+    "snake": 2.0,    # 蛇形梯度：引導大值沿左下角路徑遞減排列
+    "corner": 2.0,   # 角落錨定：最大值在角落獎勵，否則懲罰
 }
+
+# 蛇形梯度權重矩陣（左下角為最高優先位置）
+# [3][0]=15（最大值理想位置）→ 沿蛇形路徑遞減到 [0][3]=0
+SNAKE_WEIGHTS = [
+    [ 3,  2,  1,  0],   # 第 0 列（遠離角落，低優先）
+    [ 4,  5,  6,  7],   # 第 1 列
+    [11, 10,  9,  8],   # 第 2 列
+    [12, 13, 14, 15],   # 第 3 列（最接近左下角，高優先）
+]
+SNAKE_WEIGHT_SUM = 120  # 所有權重總和，用於正規化
 
 # 機率節點最多採樣幾個空格（限制分支數，維持深度 4 的速度）
 MAX_CHANCE_CELLS = 6
@@ -188,12 +200,16 @@ class HeuristicExpectimaxAI:
         max_tile = self.game.max_tile(board)
         monotonicity = self._monotonicity(board)
         merge_potential = self._merge_potential(board)
+        snake = self._snake_score(board)
+        corner = self._corner_anchor(board, max_tile)
 
         return (
             self.weights["empty_cells"] * empties
             + self.weights["monotonicity"] * monotonicity
             + self.weights["merge_potential"] * merge_potential
             + self.weights["max_tile"] * (max_tile.bit_length() - 1 if max_tile > 0 else 0)
+            + self.weights["snake"] * snake
+            + self.weights["corner"] * corner
         )
 
     def _monotonicity(self, board: Board) -> float:
@@ -220,3 +236,37 @@ class HeuristicExpectimaxAI:
                 if r + 1 < 4 and board[r + 1][c] == current:
                     score += 1
         return score
+
+    def _snake_score(self, board: Board) -> float:
+        """
+        蛇形梯度評分：依左下角蛇形權重矩陣計算盤面分，
+        鼓勵大值沿固定路徑遞減排列，防止最大值在盤面漂移。
+        回傳值已正規化（除以 SNAKE_WEIGHT_SUM）以維持量級一致性。
+        """
+        score = 0.0
+        for r in range(4):
+            for c in range(4):
+                if board[r][c] > 0:
+                    score += math.log2(board[r][c]) * SNAKE_WEIGHTS[r][c]
+        return score / SNAKE_WEIGHT_SUM
+
+    def _corner_anchor(self, board: Board, max_tile: int) -> float:
+        """
+        角落錨定獎懲：
+        - 最大值在左下角（首選錨點）：給 log2(max_tile) 獎勵
+        - 最大值在其他角落：給一半獎勵
+        - 最大值不在任何角落：給 -log2(max_tile) 懲罰
+        搭配蛇形評分，可顯著降低最大值漂離角落的機率。
+        """
+        if max_tile == 0:
+            return 0.0
+        log_max = math.log2(max_tile)
+        # 左下角為首選錨點（與蛇形矩陣方向一致）
+        if board[3][0] == max_tile:
+            return log_max
+        # 其他三個角落給部分獎勵
+        for r, c in ((0, 0), (0, 3), (3, 3)):
+            if board[r][c] == max_tile:
+                return log_max * 0.5
+        # 最大值不在任何角落：懲罰
+        return -log_max
