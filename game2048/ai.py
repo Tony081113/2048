@@ -11,12 +11,12 @@ from .core import Board, Direction, Game2048
 WEIGHTS_FILE = os.path.join(os.path.dirname(__file__), "..", "artifacts", "weights.json")
 
 DEFAULT_WEIGHTS = {
-    "empty_cells": 2.7,
+    "empty_cells": 2.0,       # 略降：不過度保守
     "monotonicity": 1.0,
-    "merge_potential": 1.5,
-    "max_tile": 1.0,
-    "snake": 2.0,    # 蛇形梯度：引導大值沿左下角路徑遞減排列
-    "corner": 2.0,   # 角落錨定：最大值在角落獎勵，否則懲罰
+    "merge_potential": 0.9,
+    "max_tile": 3.0,          # 最高：直接獎勵最大磚成長，是最重要的目標
+    "snake": 2.0,             # 維持隊形但不壓過 max_tile
+    "corner": 1.2,            # 低：不過度守成
 }
 
 # 蛇形梯度權重矩陣（左下角為最高優先位置）
@@ -33,7 +33,7 @@ SNAKE_WEIGHT_SUM = 120  # 所有權重總和，用於正規化
 MAX_CHANCE_CELLS = 6
 
 # 累積幾局後批次更新一次權重（降低 ES 單樣本噪聲）
-BATCH_SIZE = 5
+BATCH_SIZE = 3
 
 
 class HeuristicExpectimaxAI:
@@ -90,12 +90,13 @@ class HeuristicExpectimaxAI:
 
     def _compute_reward(self, score: int, max_tile: int) -> float:
         """
-        對數尺度獎勵，避免大分數主導梯度。
-        獎勵 = log(1+score) + 里程碑加分（對數域量級）
+        對數尺度獎勵 + 強化里程碑，讓 2048→4096→8192 的推力逐級增強。
         """
         log_score = math.log1p(score)
-        if max_tile >= 4096:
-            milestone = 15.0
+        if max_tile >= 8192:
+            milestone = 30.0
+        elif max_tile >= 4096:
+            milestone = 20.0
         elif max_tile >= 2048:
             milestone = 10.0
         elif max_tile >= 1024:
@@ -158,6 +159,7 @@ class HeuristicExpectimaxAI:
 
     def choose_move(self, board: Board) -> Tuple[Optional[Direction], Dict[Direction, float]]:
         # 對每個方向執行 Expectimax，選出評估分最高的移動
+        # 即時合併得分（log 尺度）直接加入評估，避免搜尋深度不足時忽略大合併
         best_move: Optional[Direction] = None
         best_value = float("-inf")
         values: Dict[Direction, float] = {}
@@ -167,7 +169,8 @@ class HeuristicExpectimaxAI:
             if not result.moved:
                 values[direction] = float("-inf")
                 continue
-            value = self.expectimax(result.board, self.depth - 1, is_chance=True)
+            immediate = math.log1p(result.score_gained) if result.score_gained > 0 else 0.0
+            value = immediate + self.expectimax(result.board, self.depth - 1, is_chance=True)
             values[direction] = value
             if value > best_value:
                 best_value = value
@@ -197,13 +200,14 @@ class HeuristicExpectimaxAI:
                     total += prob_per_cell * p * self.expectimax(next_board, depth - 1, False)
             return total
 
-        # 最大化節點：選所有方向中的最高評估值
+        # 最大化節點：選所有方向中的最高評估值（含即時合併得分）
         best = float("-inf")
         for direction in ("up", "down", "left", "right"):
             result = self.game.simulate_move(board, direction)
             if not result.moved:
                 continue
-            best = max(best, self.expectimax(result.board, depth - 1, True))
+            immediate = math.log1p(result.score_gained) if result.score_gained > 0 else 0.0
+            best = max(best, immediate + self.expectimax(result.board, depth - 1, True))
         return best if best != float("-inf") else self.evaluate(board)
 
     def evaluate(self, board: Board) -> float:
@@ -214,6 +218,7 @@ class HeuristicExpectimaxAI:
         merge_potential = self._merge_potential(board)
         snake = self._snake_score(board)
         corner = self._corner_anchor(board, max_tile)
+        danger = self._danger_penalty(empties)
 
         return (
             self.weights["empty_cells"] * empties
@@ -222,6 +227,7 @@ class HeuristicExpectimaxAI:
             + self.weights["max_tile"] * (max_tile.bit_length() - 1 if max_tile > 0 else 0)
             + self.weights["snake"] * snake
             + self.weights["corner"] * corner
+            + danger  # 危機懲罰不參與 ES 學習，固定套用
         )
 
     def _monotonicity(self, board: Board) -> float:
@@ -264,21 +270,30 @@ class HeuristicExpectimaxAI:
 
     def _corner_anchor(self, board: Board, max_tile: int) -> float:
         """
-        角落錨定獎懲：
-        - 最大值在左下角（首選錨點）：給 log2(max_tile) 獎勵
-        - 最大值在其他角落：給一半獎勵
-        - 最大值不在任何角落：給 -log2(max_tile) 懲罰
-        搭配蛇形評分，可顯著降低最大值漂離角落的機率。
+        角落錨定懲罰（硬規則版）：
+        - 最大值在左下角：給 log2(max_tile) 獎勵
+        - 最大值在其他角落：給 -0.5*log2(max_tile) 懲罰
+        - 最大值不在任何角落：給 -log2(max_tile) 重罰
+        corner 權重現為 1.5，避免過度守成而不願冒險合成更大磚。
         """
         if max_tile == 0:
             return 0.0
         log_max = math.log2(max_tile)
-        # 左下角為首選錨點（與蛇形矩陣方向一致）
         if board[3][0] == max_tile:
             return log_max
-        # 其他三個角落給部分獎勵
         for r, c in ((0, 0), (0, 3), (3, 3)):
             if board[r][c] == max_tile:
-                return log_max * 0.5
-        # 最大值不在任何角落：懲罰
+                return -log_max * 0.5
         return -log_max
+
+    def _danger_penalty(self, empties: int) -> float:
+        """
+        空格稀少危機懲罰（固定規則，不參與 ES 學習）：
+        空格 <= 2：重罰 -20（瀕死局面）
+        空格 <= 4：中罰 -5（高壓局面）
+        """
+        if empties <= 2:
+            return -20.0
+        if empties <= 4:
+            return -5.0
+        return 0.0
