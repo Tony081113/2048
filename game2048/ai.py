@@ -10,13 +10,15 @@ from .core import Board, Direction, Game2048
 # 學習到的基準權重儲存路徑
 WEIGHTS_FILE = os.path.join(os.path.dirname(__file__), "..", "artifacts", "weights.json")
 
+# 預設權重（衝 4096 均衡版）
+# corner/snake 降低 → 減少守成；max_tile 提高 → 鼓勵繼續長大
 DEFAULT_WEIGHTS = {
     "empty_cells": 2.7,
     "monotonicity": 1.0,
-    "merge_potential": 1.0,   # 降低：減少「看到能合就先合」的貪心行為
-    "max_tile": 1.0,
-    "snake": 3.5,             # 提高：更強力引導蛇形隊形
-    "corner": 4.0,            # 提高：更嚴格要求最大值鎖在左下角
+    "merge_potential": 0.9,   # 略降：減少短期合的誘惑
+    "max_tile": 2.2,          # 大幅提高：直接獎勵最大磚成長
+    "snake": 2.5,             # 適度：維持隊形但不過度保守
+    "corner": 1.5,            # 降低：允許為了 4096 暫時犧牲角落位置
 }
 
 # 蛇形梯度權重矩陣（左下角為最高優先位置）
@@ -90,12 +92,14 @@ class HeuristicExpectimaxAI:
 
     def _compute_reward(self, score: int, max_tile: int) -> float:
         """
-        對數尺度獎勵，避免大分數主導梯度。
-        獎勵 = log(1+score) + 里程碑加分（對數域量級）
+        對數尺度獎勵 + 強化里程碑，讓 2048→4096→8192 的推力逐級增強。
+        里程碑間距拉大，確保每個突破都有明確的學習訊號。
         """
         log_score = math.log1p(score)
-        if max_tile >= 4096:
-            milestone = 15.0
+        if max_tile >= 8192:
+            milestone = 30.0
+        elif max_tile >= 4096:
+            milestone = 20.0   # 4096 獎勵提高（舊版只有 15）
         elif max_tile >= 2048:
             milestone = 10.0
         elif max_tile >= 1024:
@@ -266,31 +270,27 @@ class HeuristicExpectimaxAI:
 
     def _corner_anchor(self, board: Board, max_tile: int) -> float:
         """
-        角落錨定懲罰（硬規則版）：
-        - 最大值在左下角（唯一首選錨點）：給 log2(max_tile) 獎勵
-        - 最大值在其他角落：給 -0.5*log2(max_tile) 懲罰（不給正分）
-        - 最大值不在任何角落：給 -log2(max_tile) 大懲罰
-        只有鎖定左下角才算「正確」，其他角落不再給容錯空間。
+        角落錨定懲罰：
+        - 最大值在左下角（首選錨點）：給 log2(max_tile) 獎勵
+        - 最大值在其他角落：給 -0.5*log2(max_tile) 懲罰
+        - 最大值不在任何角落：給 -log2(max_tile) 重罰
+        corner 權重現為 1.5，避免過度守成而不願冒險合成更大磚。
         """
         if max_tile == 0:
             return 0.0
         log_max = math.log2(max_tile)
-        # 左下角為唯一首選錨點
         if board[3][0] == max_tile:
             return log_max
-        # 其他三個角落：給懲罰，不給獎勵（強迫 AI 學習專鎖左下角）
         for r, c in ((0, 0), (0, 3), (3, 3)):
             if board[r][c] == max_tile:
                 return -log_max * 0.5
-        # 最大值不在任何角落：重罰
         return -log_max
 
     def _danger_penalty(self, empties: int) -> float:
         """
         空格稀少危機懲罰（固定規則，不參與 ES 學習）：
-        空格 <= 2：重罰 -20（瀕死局面，避免此類決策）
-        空格 <= 4：中罰 -5（高壓局面，提高警覺）
-        這讓 AI 主動在空格充裕時就佈局，而非等到無路可走。
+        空格 <= 2：重罰 -20（瀕死局面）
+        空格 <= 4：中罰 -5（高壓局面）
         """
         if empties <= 2:
             return -20.0
