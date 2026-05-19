@@ -13,10 +13,10 @@ WEIGHTS_FILE = os.path.join(os.path.dirname(__file__), "..", "artifacts", "weigh
 DEFAULT_WEIGHTS = {
     "empty_cells": 2.7,
     "monotonicity": 1.0,
-    "merge_potential": 1.5,
+    "merge_potential": 1.0,   # 降低：減少「看到能合就先合」的貪心行為
     "max_tile": 1.0,
-    "snake": 2.0,    # 蛇形梯度：引導大值沿左下角路徑遞減排列
-    "corner": 2.0,   # 角落錨定：最大值在角落獎勵，否則懲罰
+    "snake": 3.5,             # 提高：更強力引導蛇形隊形
+    "corner": 4.0,            # 提高：更嚴格要求最大值鎖在左下角
 }
 
 # 蛇形梯度權重矩陣（左下角為最高優先位置）
@@ -214,6 +214,7 @@ class HeuristicExpectimaxAI:
         merge_potential = self._merge_potential(board)
         snake = self._snake_score(board)
         corner = self._corner_anchor(board, max_tile)
+        danger = self._danger_penalty(empties)
 
         return (
             self.weights["empty_cells"] * empties
@@ -222,6 +223,7 @@ class HeuristicExpectimaxAI:
             + self.weights["max_tile"] * (max_tile.bit_length() - 1 if max_tile > 0 else 0)
             + self.weights["snake"] * snake
             + self.weights["corner"] * corner
+            + danger  # 危機懲罰不參與 ES 學習，固定套用
         )
 
     def _monotonicity(self, board: Board) -> float:
@@ -264,21 +266,34 @@ class HeuristicExpectimaxAI:
 
     def _corner_anchor(self, board: Board, max_tile: int) -> float:
         """
-        角落錨定獎懲：
-        - 最大值在左下角（首選錨點）：給 log2(max_tile) 獎勵
-        - 最大值在其他角落：給一半獎勵
-        - 最大值不在任何角落：給 -log2(max_tile) 懲罰
-        搭配蛇形評分，可顯著降低最大值漂離角落的機率。
+        角落錨定懲罰（硬規則版）：
+        - 最大值在左下角（唯一首選錨點）：給 log2(max_tile) 獎勵
+        - 最大值在其他角落：給 -0.5*log2(max_tile) 懲罰（不給正分）
+        - 最大值不在任何角落：給 -log2(max_tile) 大懲罰
+        只有鎖定左下角才算「正確」，其他角落不再給容錯空間。
         """
         if max_tile == 0:
             return 0.0
         log_max = math.log2(max_tile)
-        # 左下角為首選錨點（與蛇形矩陣方向一致）
+        # 左下角為唯一首選錨點
         if board[3][0] == max_tile:
             return log_max
-        # 其他三個角落給部分獎勵
+        # 其他三個角落：給懲罰，不給獎勵（強迫 AI 學習專鎖左下角）
         for r, c in ((0, 0), (0, 3), (3, 3)):
             if board[r][c] == max_tile:
-                return log_max * 0.5
-        # 最大值不在任何角落：懲罰
+                return -log_max * 0.5
+        # 最大值不在任何角落：重罰
         return -log_max
+
+    def _danger_penalty(self, empties: int) -> float:
+        """
+        空格稀少危機懲罰（固定規則，不參與 ES 學習）：
+        空格 <= 2：重罰 -20（瀕死局面，避免此類決策）
+        空格 <= 4：中罰 -5（高壓局面，提高警覺）
+        這讓 AI 主動在空格充裕時就佈局，而非等到無路可走。
+        """
+        if empties <= 2:
+            return -20.0
+        if empties <= 4:
+            return -5.0
+        return 0.0
