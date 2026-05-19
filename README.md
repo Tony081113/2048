@@ -10,18 +10,18 @@
 ## 執行方式
 
 ```bash
-python /home/runner/work/2048/2048/main.py
+python main.py
 ```
 
 或：
 
 ```bash
-python /home/runner/work/2048/2048/game_2048_ai.py
+python game_2048_ai.py
 ```
 
 ## 專案結構
 
-- `/home/runner/work/2048/2048/game2048/core.py`：2048 核心規則與盤面狀態
-- `/home/runner/work/2048/2048/game2048/ai.py`：AI 決策（Expectimax + heuristic）
-- `/home/runner/work/2048/2048/game2048/gui.py`：Tkinter GUI 與即時訓練可視化
-- `/home/runner/work/2048/2048/tests/`：核心與 AI 單元測試
+- `game2048/core.py`：2048 核心規則與盤面狀態
+- `game2048/ai.py`：AI 決策（Expectimax + heuristic）
+- `game2048/gui.py`：Tkinter GUI 與即時訓練可視化
+- `tests/`：核心與 AI 單元測試
