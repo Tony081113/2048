@@ -25,7 +25,7 @@ class GameGUI:
     def __init__(self) -> None:
         # 初始化遊戲核心與 AI
         self.game = Game2048()
-        self.ai = HeuristicExpectimaxAI(self.game, depth=2)
+        self.ai = HeuristicExpectimaxAI(self.game, depth=4)
 
         self.root = tk.Tk()
         self.root.title("2048 + AI 訓練")
@@ -255,9 +255,9 @@ class GameGUI:
         # 顯示已學習的基準權重（非擾動值）
         self.weights_label.configure(text="\n".join([f"{k}: {v:.3f}" for k, v in self.ai.base_weights.items()]))
 
-        # 學習進度
-        self.baseline_label.configure(text=f"基準獎勵: {self.ai.baseline:,.0f}")
-        self.last_reward_label.configure(text=f"上局獎勵: {self.ai.last_reward:,.0f}")
+        # 學習進度（獎勵為對數域，範圍約 0~25）
+        self.baseline_label.configure(text=f"基準獎勵: {self.ai.baseline:.2f}")
+        self.last_reward_label.configure(text=f"上局獎勵: {self.ai.last_reward:.2f}")
         self.learn_ep_label.configure(text=f"訓練局數: {self.ai.episode_count}")
 
         # 顯示上次各方向的評估分數

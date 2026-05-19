@@ -1,7 +1,8 @@
 import json
+import math
 import os
 import random
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .core import Board, Direction, Game2048
 
@@ -16,22 +17,30 @@ DEFAULT_WEIGHTS = {
     "max_tile": 1.0,
 }
 
+# 機率節點最多採樣幾個空格（限制分支數，維持深度 4 的速度）
+MAX_CHANCE_CELLS = 6
+
+# 累積幾局後批次更新一次權重（降低 ES 單樣本噪聲）
+BATCH_SIZE = 5
+
 
 class HeuristicExpectimaxAI:
-    def __init__(self, game: Game2048, depth: int = 2) -> None:
+    def __init__(self, game: Game2048, depth: int = 4) -> None:
         self.game = game
         self.depth = depth
 
         # Evolution Strategies 學習超參數
         self.sigma = 0.15          # 每局權重擾動的標準差
-        self.lr = 0.03             # 梯度更新學習率
+        self.lr = 0.05             # 梯度更新學習率
         self.baseline_alpha = 0.1  # 基準線指數移動平均係數
 
         # 學習狀態
         self.baseline = 0.0        # 獎勵基準線（EMA）
-        self.last_reward = 0.0     # 上一局獎勵
+        self.last_reward = 0.0     # 上一局獎勵（對數域）
         self.episode_count = 0     # 總訓練局數
         self._noise: Dict[str, float] = {}
+        # 批次 buffer：儲存 (reward, noise) 等待批次更新
+        self._episode_buffer: List[Tuple[float, Dict[str, float]]] = []
 
         # 從檔案載入已學習的基準權重，或使用預設值
         self.base_weights = self._load_weights()
@@ -39,11 +48,15 @@ class HeuristicExpectimaxAI:
         self._apply_perturbation()
 
     def _load_weights(self) -> Dict[str, float]:
-        """從 JSON 載入已學習的基準權重"""
+        """從 JSON 載入已學習的基準權重；若值域異常（舊版暴衝）則重置"""
         try:
             with open(WEIGHTS_FILE, encoding="utf-8") as f:
                 data = json.load(f)
-            return {k: float(data.get(k, DEFAULT_WEIGHTS[k])) for k in DEFAULT_WEIGHTS}
+            weights = {k: float(data.get(k, DEFAULT_WEIGHTS[k])) for k in DEFAULT_WEIGHTS}
+            # 任何權重超出 [0, 50] 視為損壞，重置
+            if any(v < 0 or v > 50.0 for v in weights.values()):
+                return DEFAULT_WEIGHTS.copy()
+            return weights
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             return DEFAULT_WEIGHTS.copy()
 
@@ -58,45 +71,66 @@ class HeuristicExpectimaxAI:
         self._noise = {k: random.gauss(0, self.sigma) for k in self.base_weights}
         self.weights = {k: max(0.05, self.base_weights[k] + self._noise[k]) for k in self.base_weights}
 
+    def _compute_reward(self, score: int, max_tile: int) -> float:
+        """
+        對數尺度獎勵，避免大分數主導梯度。
+        獎勵 = log(1+score) + 里程碑加分（對數域量級）
+        """
+        log_score = math.log1p(score)
+        if max_tile >= 4096:
+            milestone = 15.0
+        elif max_tile >= 2048:
+            milestone = 10.0
+        elif max_tile >= 1024:
+            milestone = 6.0
+        elif max_tile >= 512:
+            milestone = 3.0
+        else:
+            milestone = 0.0
+        return log_score + milestone
+
     def on_episode_end(self, score: int, max_tile: int) -> float:
         """
-        每局結束後根據獎懲更新基準權重（ES 梯度估計）。
-        獎勵 = 分數 + 達到高方塊的里程碑加分
+        每局結束後累積到 buffer，滿 BATCH_SIZE 局再做批次正規化梯度更新。
         """
-        # 里程碑加分：鼓勵 AI 衝高方塊
-        if max_tile >= 4096:
-            milestone_bonus = 20000
-        elif max_tile >= 2048:
-            milestone_bonus = 8000
-        elif max_tile >= 1024:
-            milestone_bonus = 2000
-        elif max_tile >= 512:
-            milestone_bonus = 400
-        else:
-            milestone_bonus = 0
-
-        reward = float(score + milestone_bonus)
+        reward = self._compute_reward(score, max_tile)
         self.last_reward = reward
 
-        # 計算優勢（本局超出基準線的程度）
-        advantage = reward - self.baseline
-        # 更新基準線（指數移動平均）
+        # 更新基準線（EMA）
         self.baseline = (1 - self.baseline_alpha) * self.baseline + self.baseline_alpha * reward
 
-        # ES 梯度估計：沿擾動方向調整基準權重
-        for k in self.base_weights:
-            grad = advantage * self._noise[k] / (self.sigma ** 2)
-            self.base_weights[k] = max(0.05, self.base_weights[k] + self.lr * grad)
-
+        # 累積本局資料
+        self._episode_buffer.append((reward, self._noise.copy()))
         self.episode_count += 1
-        # 套用下一局的新擾動
         self._apply_perturbation()
 
-        # 每 10 局持久化儲存一次
+        # 批次更新
+        if len(self._episode_buffer) >= BATCH_SIZE:
+            self._batch_update()
+            self._episode_buffer = []
+
         if self.episode_count % 10 == 0:
             self._save_weights()
 
         return reward
+
+    def _batch_update(self) -> None:
+        """
+        批次 ES 梯度估計：對 buffer 內所有局標準化優勢後加總梯度，
+        並截斷 ±1.0 防止暴衝，權重限制在 [0.05, 20.0]。
+        """
+        rewards = [r for r, _ in self._episode_buffer]
+        mean_r = sum(rewards) / len(rewards)
+        std_r = (sum((r - mean_r) ** 2 for r in rewards) / len(rewards)) ** 0.5 + 1e-8
+
+        for k in self.base_weights:
+            grad = 0.0
+            for r, noise in self._episode_buffer:
+                advantage = (r - mean_r) / std_r  # 標準化優勢，消除量級影響
+                grad += advantage * noise[k]
+            grad /= len(self._episode_buffer) * self.sigma
+            grad = max(-1.0, min(1.0, grad))       # 梯度截斷
+            self.base_weights[k] = max(0.05, min(20.0, self.base_weights[k] + self.lr * grad))
 
     def choose_move(self, board: Board) -> Tuple[Optional[Direction], Dict[Direction, float]]:
         # 對每個方向執行 Expectimax，選出評估分最高的移動
@@ -127,6 +161,9 @@ class HeuristicExpectimaxAI:
             empties = self.game.empty_cells(board)
             if not empties:
                 return self.evaluate(board)
+            # 空格太多時隨機採樣，限制分支數以維持深度 4 的回應速度
+            if len(empties) > MAX_CHANCE_CELLS:
+                empties = random.sample(empties, MAX_CHANCE_CELLS)
             total = 0.0
             prob_per_cell = 1.0 / len(empties)
             for r, c in empties:
