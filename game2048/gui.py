@@ -1,7 +1,8 @@
 import tkinter as tk
-from typing import Dict
+from typing import Dict, Optional
 
 from .ai import HeuristicExpectimaxAI
+from .charts import ChartWindow
 from .core import Direction, Game2048
 
 
@@ -42,6 +43,7 @@ class GameGUI:
         self.delay_ms = tk.IntVar(value=200)  # AI 每步延遲（毫秒）
         self.ai_running = False
         self._fullscreen = False  # 真正全螢幕狀態（F11 切換）
+        self._chart_win: Optional[ChartWindow] = None  # 圖表視窗參考
 
         self._build_ui()
         self._bind_keys()
@@ -93,7 +95,11 @@ class GameGUI:
         self.toggle_btn = tk.Button(control_row, text="切換至 AI 模式 (M)", command=self.toggle_mode)
         self.toggle_btn.pack(side="left", padx=(0, 8))
 
-        tk.Button(control_row, text="重新開始 (R)", command=self.restart_game).pack(side="left")
+        tk.Button(control_row, text="重新開始 (R)", command=self.restart_game).pack(side="left", padx=(0, 8))
+
+        # 觀察圖表按鈕（開啟獨立圖表視窗）
+        tk.Button(control_row, text="觀察圖表 (C)", command=self.open_charts,
+                  bg="#e8f5e9", activebackground="#c8e6c9").pack(side="left")
 
         # 右側 AI 資訊面板
         tk.Label(right, text="AI 資訊面板", font=("Arial", 12, "bold"), bg="#f3eee6").pack(anchor="w", padx=10, pady=(10, 8))
@@ -137,30 +143,33 @@ class GameGUI:
         )
         self.speed_scale.pack(padx=10, pady=(0, 10))
 
-        tk.Label(right, text="快捷鍵: 方向鍵=移動, M=模式\n+/-=速度, F11=全螢幕", bg="#f3eee6", fg="#555", justify="left").pack(
+        tk.Label(right, text="快捷鍵: 方向鍵=移動, M=模式\n+/-=速度, C=圖表, F11=全螢幕",
+                 bg="#f3eee6", fg="#555", justify="left").pack(
             anchor="w", padx=10, pady=(0, 10)
         )
 
     def _bind_keys(self) -> None:
         # 使用 bind_all 確保任何元件有焦點時皆可觸發
-        self.root.bind_all("<Up>", lambda _e: self.manual_move("up"))
-        self.root.bind_all("<Down>", lambda _e: self.manual_move("down"))
-        self.root.bind_all("<Left>", lambda _e: self.manual_move("left"))
+        self.root.bind_all("<Up>",    lambda _e: self.manual_move("up"))
+        self.root.bind_all("<Down>",  lambda _e: self.manual_move("down"))
+        self.root.bind_all("<Left>",  lambda _e: self.manual_move("left"))
         self.root.bind_all("<Right>", lambda _e: self.manual_move("right"))
         self.root.bind_all("m", lambda _e: self.toggle_mode())
         self.root.bind_all("M", lambda _e: self.toggle_mode())
         self.root.bind_all("r", lambda _e: self.restart_game())
         self.root.bind_all("R", lambda _e: self.restart_game())
+        self.root.bind_all("c", lambda _e: self.open_charts())
+        self.root.bind_all("C", lambda _e: self.open_charts())
         # + 鍵加速（含數字鍵盤）
-        self.root.bind_all("+", lambda _e: self.adjust_speed(-20))
-        self.root.bind_all("=", lambda _e: self.adjust_speed(-20))
-        self.root.bind_all("<KP_Add>", lambda _e: self.adjust_speed(-20))
+        self.root.bind_all("+",          lambda _e: self.adjust_speed(-20))
+        self.root.bind_all("=",          lambda _e: self.adjust_speed(-20))
+        self.root.bind_all("<KP_Add>",   lambda _e: self.adjust_speed(-20))
         # - 鍵減速（含數字鍵盤）
-        self.root.bind_all("-", lambda _e: self.adjust_speed(20))
-        self.root.bind_all("_", lambda _e: self.adjust_speed(20))
+        self.root.bind_all("-",             lambda _e: self.adjust_speed(20))
+        self.root.bind_all("_",             lambda _e: self.adjust_speed(20))
         self.root.bind_all("<KP_Subtract>", lambda _e: self.adjust_speed(20))
         # F11 切換真正全螢幕
-        self.root.bind_all("<F11>", lambda _e: self._toggle_fullscreen())
+        self.root.bind_all("<F11>",   lambda _e: self._toggle_fullscreen())
         self.root.bind_all("<Escape>", lambda _e: self._exit_fullscreen())
 
     def _toggle_fullscreen(self) -> None:
@@ -198,6 +207,17 @@ class GameGUI:
             self.toggle_btn.configure(text="切換至 AI 模式 (M)")
             self.ai_running = False
         self.draw()
+
+    def open_charts(self) -> None:
+        """開啟或重新整理獨立圖表視窗（與遊戲視窗分開）"""
+        if self._chart_win is None or not self._chart_win.win.winfo_exists():
+            # 圖表視窗不存在或已被關閉，重新建立
+            self._chart_win = ChartWindow(self.root, self.ai)
+        else:
+            # 已存在：帶到最前並立即刷新
+            self._chart_win.win.lift()
+            self._chart_win.win.focus_force()
+            self._chart_win.refresh()
 
     def manual_move(self, direction: Direction) -> None:
         # 手動模式下處理玩家移動

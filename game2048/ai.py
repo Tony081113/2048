@@ -54,6 +54,11 @@ class HeuristicExpectimaxAI:
         # 批次 buffer：儲存 (reward, noise) 等待批次更新
         self._episode_buffer: List[Tuple[float, Dict[str, float]]] = []
 
+        # 歷史紀錄（供圖表觀察視窗使用）
+        self.score_history: List[int] = []
+        self.tile_history: List[int] = []
+        self.weights_history: List[Dict[str, float]] = []  # 每批次更新後快照
+
         # 從檔案載入已學習的基準權重，或使用預設值
         self.base_weights = self._load_weights()
         # 套用初始擾動，得到本局實際使用的權重
@@ -116,6 +121,10 @@ class HeuristicExpectimaxAI:
         self.episode_count += 1
         self._apply_perturbation()
 
+        # 記錄每局歷史（供圖表觀察）
+        self.score_history.append(score)
+        self.tile_history.append(max_tile)
+
         # 批次更新
         if len(self._episode_buffer) >= BATCH_SIZE:
             self._batch_update()
@@ -143,6 +152,9 @@ class HeuristicExpectimaxAI:
             grad /= len(self._episode_buffer) * self.sigma
             grad = max(-1.0, min(1.0, grad))       # 梯度截斷
             self.base_weights[k] = max(0.05, min(20.0, self.base_weights[k] + self.lr * grad))
+
+        # 批次更新完成後快照一次權重（供圖表觀察）
+        self.weights_history.append(self.base_weights.copy())
 
     def choose_move(self, board: Board) -> Tuple[Optional[Direction], Dict[Direction, float]]:
         # 對每個方向執行 Expectimax，選出評估分最高的移動
