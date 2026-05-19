@@ -9,6 +9,7 @@ Direction = str
 
 @dataclass
 class MoveResult:
+    # 移動後的棋盤、是否有效移動、本次得分
     board: Board
     moved: bool
     score_gained: int
@@ -20,27 +21,33 @@ class Game2048:
         self.score = 0
         self.best_score = 0
         self.board = self.new_board()
+        # 初始放置兩個隨機方塊
         self.add_random_tile()
         self.add_random_tile()
 
     def new_board(self) -> Board:
+        # 建立全零的空棋盤
         return [[0 for _ in range(self.size)] for _ in range(self.size)]
 
     def clone_board(self, board: Optional[Board] = None) -> Board:
+        # 複製棋盤（預設複製當前棋盤）
         src = self.board if board is None else board
         return [row[:] for row in src]
 
     def reset(self) -> None:
+        # 重置分數與棋盤，重新放置兩個隨機方塊
         self.score = 0
         self.board = self.new_board()
         self.add_random_tile()
         self.add_random_tile()
 
     def empty_cells(self, board: Optional[Board] = None) -> List[Tuple[int, int]]:
+        # 回傳所有空格的座標列表
         b = self.board if board is None else board
         return [(r, c) for r in range(self.size) for c in range(self.size) if b[r][c] == 0]
 
     def add_random_tile(self, board: Optional[Board] = None) -> None:
+        # 在隨機空格放置 2（90%）或 4（10%）
         b = self.board if board is None else board
         empties = self.empty_cells(b)
         if not empties:
@@ -49,6 +56,7 @@ class Game2048:
         b[r][c] = 4 if random.random() < 0.1 else 2
 
     def _compress_line(self, line: List[int]) -> Tuple[List[int], int]:
+        # 將一行向左壓縮並合併相鄰相同數字，回傳新行與得分
         non_zero = [x for x in line if x != 0]
         result = []
         gained = 0
@@ -66,6 +74,7 @@ class Game2048:
         return result, gained
 
     def simulate_move(self, board: Board, direction: Direction) -> MoveResult:
+        # 模擬指定方向的移動，不修改原始棋盤
         b = [row[:] for row in board]
         moved = False
         total_gained = 0
@@ -108,11 +117,12 @@ class Game2048:
                 total_gained += gained
                 set_col(c, list(reversed(merged)))
         else:
-            raise ValueError(f"Unknown direction: {direction}")
+            raise ValueError(f"未知方向: {direction}")
 
         return MoveResult(board=b, moved=moved, score_gained=total_gained)
 
     def move(self, direction: Direction) -> bool:
+        # 執行實際移動，若有變動則加分並新增隨機方塊
         result = self.simulate_move(self.board, direction)
         if not result.moved:
             return False
@@ -123,6 +133,7 @@ class Game2048:
         return True
 
     def can_move(self, board: Optional[Board] = None) -> bool:
+        # 判斷棋盤是否還有合法移動（有空格或有可合併的相鄰方塊）
         b = self.board if board is None else board
         if self.empty_cells(b):
             return True
@@ -136,5 +147,6 @@ class Game2048:
         return False
 
     def max_tile(self, board: Optional[Board] = None) -> int:
+        # 回傳棋盤上的最大方塊值
         b = self.board if board is None else board
         return max(max(row) for row in b)
