@@ -1,8 +1,17 @@
 import tkinter as tk
-from typing import Dict
+from tkinter import messagebox
+from typing import Dict, Optional
 
 from .ai import HeuristicExpectimaxAI
 from .core import Direction, Game2048
+
+# 嘗試匯入圖表模組；若 matplotlib 未安裝則優雅降級
+try:
+    from .charts import ChartWindow
+    _CHARTS_AVAILABLE = True
+except ImportError:
+    ChartWindow = None  # type: ignore
+    _CHARTS_AVAILABLE = False
 
 
 # 方塊顏色對應表（數值 → 背景色）
@@ -42,6 +51,7 @@ class GameGUI:
         self.delay_ms = tk.IntVar(value=200)  # AI 每步延遲（毫秒）
         self.ai_running = False
         self._fullscreen = False  # 真正全螢幕狀態（F11 切換）
+        self._chart_win: Optional["ChartWindow"] = None  # 圖表視窗參考
 
         self._build_ui()
         self._bind_keys()
@@ -93,7 +103,12 @@ class GameGUI:
         self.toggle_btn = tk.Button(control_row, text="切換至 AI 模式 (M)", command=self.toggle_mode)
         self.toggle_btn.pack(side="left", padx=(0, 8))
 
-        tk.Button(control_row, text="重新開始 (R)", command=self.restart_game).pack(side="left")
+        tk.Button(control_row, text="重新開始 (R)", command=self.restart_game).pack(side="left", padx=(0, 8))
+
+        # 觀察圖表按鈕（開啟獨立圖表視窗）
+        chart_btn_color = "#e8f5e9" if _CHARTS_AVAILABLE else "#ffebee"
+        tk.Button(control_row, text="觀察圖表 (C)", command=self.open_charts,
+                  bg=chart_btn_color, activebackground="#c8e6c9").pack(side="left")
 
         # 右側 AI 資訊面板
         tk.Label(right, text="AI 資訊面板", font=("Arial", 12, "bold"), bg="#f3eee6").pack(anchor="w", padx=10, pady=(10, 8))
@@ -137,7 +152,7 @@ class GameGUI:
         )
         self.speed_scale.pack(padx=10, pady=(0, 10))
 
-        tk.Label(right, text="快捷鍵: 方向鍵=移動, M=模式\n+/-=速度, F11=全螢幕", bg="#f3eee6", fg="#555", justify="left").pack(
+        tk.Label(right, text="快捷鍵: 方向鍵=移動, M=模式\n+/-=速度, C=圖表, F11=全螢幕", bg="#f3eee6", fg="#555", justify="left").pack(
             anchor="w", padx=10, pady=(0, 10)
         )
 
@@ -151,6 +166,8 @@ class GameGUI:
         self.root.bind_all("M", lambda _e: self.toggle_mode())
         self.root.bind_all("r", lambda _e: self.restart_game())
         self.root.bind_all("R", lambda _e: self.restart_game())
+        self.root.bind_all("c", lambda _e: self.open_charts())
+        self.root.bind_all("C", lambda _e: self.open_charts())
         # + 鍵加速（含數字鍵盤）
         self.root.bind_all("+", lambda _e: self.adjust_speed(-20))
         self.root.bind_all("=", lambda _e: self.adjust_speed(-20))
@@ -198,6 +215,24 @@ class GameGUI:
             self.toggle_btn.configure(text="切換至 AI 模式 (M)")
             self.ai_running = False
         self.draw()
+
+    def open_charts(self) -> None:
+        """開啟或重新整理獨立圖表視窗（與遊戲視窗分開）"""
+        if not _CHARTS_AVAILABLE:
+            messagebox.showerror(
+                "缺少 matplotlib",
+                "圖表功能需要 matplotlib，請在命令列執行：\n\n"
+                "  pip install matplotlib\n\n"
+                "安裝後重新啟動遊戲即可使用圖表。"
+            )
+            return
+
+        if self._chart_win is None or not self._chart_win.win.winfo_exists():
+            self._chart_win = ChartWindow(self.root, self.ai)
+        else:
+            self._chart_win.win.lift()
+            self._chart_win.win.focus_force()
+            self._chart_win.refresh()
 
     def manual_move(self, direction: Direction) -> None:
         # 手動模式下處理玩家移動

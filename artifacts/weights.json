@@ -1,8 +1,8 @@
 {
-  "empty_cells": 2.0,
-  "monotonicity": 1.0,
-  "merge_potential": 0.9,
-  "max_tile": 3.0,
-  "snake": 2.0,
-  "corner": 1.2
+  "empty_cells": 2.624276612087499,
+  "monotonicity": 1.0741407629720425,
+  "merge_potential": 1.509349010715872,
+  "max_tile": 1.1143506370649232,
+  "snake": 1.9811121298068164,
+  "corner": 1.9868220767917002
 }

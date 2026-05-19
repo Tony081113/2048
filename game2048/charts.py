@@ -17,6 +17,14 @@ import matplotlib
 import matplotlib.ticker
 import matplotlib.patches as mpatches
 matplotlib.use("TkAgg")
+
+# Windows 上使用 Microsoft YaHei 顯示中文，找不到就降回 sans-serif
+import matplotlib.font_manager as _fm
+_cjk_fonts = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
+_available = {f.name for f in _fm.fontManager.ttflist}
+_chosen = next((f for f in _cjk_fonts if f in _available), "sans-serif")
+matplotlib.rcParams["font.family"] = _chosen
+matplotlib.rcParams["axes.unicode_minus"] = False  # 負號不用特殊字元
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
