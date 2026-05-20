@@ -9,6 +9,7 @@ from .core import Board, Direction, Game2048
 
 # 學習到的基準權重儲存路徑
 WEIGHTS_FILE = os.path.join(os.path.dirname(__file__), "..", "artifacts", "weights.json")
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "..", "artifacts", "training_history.json")
 
 DEFAULT_WEIGHTS = {
     "empty_cells": 2.0,       # 略降：不過度保守
@@ -29,11 +30,25 @@ SNAKE_WEIGHTS = [
 ]
 SNAKE_WEIGHT_SUM = 120  # 所有權重總和，用於正規化
 
+# 蛇行順序（由高優先到低優先）與違規懲罰強度
+SNAKE_PATH = [
+    (3, 0), (3, 1), (3, 2), (3, 3),
+    (2, 3), (2, 2), (2, 1), (2, 0),
+    (1, 0), (1, 1), (1, 2), (1, 3),
+    (0, 3), (0, 2), (0, 1), (0, 0),
+]
+SNAKE_VIOLATION_COEF = 2.0
+
 # 機率節點最多採樣幾個空格（限制分支數，維持深度 4 的速度）
 MAX_CHANCE_CELLS = 6
 
 # 累積幾局後批次更新一次權重（降低 ES 單樣本噪聲）
 BATCH_SIZE = 3
+
+# ES 探索率：僅部分回合使用擾動權重，避免每局都因探索而壓低勝率
+INITIAL_EXPLORATION_RATE = 0.35
+MIN_EXPLORATION_RATE = 0.08
+EXPLORATION_DECAY = 0.995
 
 
 class HeuristicExpectimaxAI:
@@ -51,18 +66,20 @@ class HeuristicExpectimaxAI:
         self.last_reward = 0.0     # 上一局獎勵（對數域）
         self.episode_count = 0     # 總訓練局數
         self._noise: Dict[str, float] = {}
+        self._episode_exploring = False
+        self.exploration_rate = INITIAL_EXPLORATION_RATE
         # 批次 buffer：儲存 (reward, noise) 等待批次更新
         self._episode_buffer: List[Tuple[float, Dict[str, float]]] = []
 
-        # 歷史紀錄（供圖表觀察）
+        # 從檔案載入已學習的基準權重，或使用預設值
+        self.base_weights = self._load_weights()
+        # 歷史紀錄（供圖表觀察，支援跨重啟保留）
         self.score_history: List[int] = []
         self.tile_history: List[int] = []
         self.weights_history: List[Dict[str, float]] = []  # 每批次更新後快照
-
-        # 從檔案載入已學習的基準權重，或使用預設值
-        self.base_weights = self._load_weights()
-        # 套用初始擾動，得到本局實際使用的權重
-        self._apply_perturbation()
+        self._load_history()
+        # 初始化本局決策權重（探索或利用）
+        self._start_episode_policy()
 
     def _load_weights(self) -> Dict[str, float]:
         """從 JSON 載入已學習的基準權重；若值域異常（舊版暴衝）則重置"""
@@ -83,14 +100,74 @@ class HeuristicExpectimaxAI:
         with open(WEIGHTS_FILE, "w", encoding="utf-8") as f:
             json.dump(self.base_weights, f, indent=2, ensure_ascii=False)
 
-    def _apply_perturbation(self) -> None:
-        """對基準權重加高斯擾動，得到本局決策用的權重"""
-        self._noise = {k: random.gauss(0, self.sigma) for k in self.base_weights}
-        self.weights = {k: max(0.05, self.base_weights[k] + self._noise[k]) for k in self.base_weights}
+    def _load_history(self) -> None:
+        """載入圖表歷史資料；格式不符時自動忽略。"""
+        try:
+            with open(HISTORY_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+
+            scores = data.get("score_history", [])
+            tiles = data.get("tile_history", [])
+            weights = data.get("weights_history", [])
+
+            self.score_history = [int(x) for x in scores if isinstance(x, (int, float))]
+            self.tile_history = [int(x) for x in tiles if isinstance(x, (int, float))]
+
+            valid_weights: List[Dict[str, float]] = []
+            for snap in weights:
+                if not isinstance(snap, dict):
+                    continue
+                row = {}
+                ok = True
+                for k in DEFAULT_WEIGHTS:
+                    if k not in snap:
+                        ok = False
+                        break
+                    try:
+                        row[k] = float(snap[k])
+                    except (TypeError, ValueError):
+                        ok = False
+                        break
+                if ok:
+                    valid_weights.append(row)
+            self.weights_history = valid_weights
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+            self.score_history = []
+            self.tile_history = []
+            self.weights_history = []
+
+    def _save_history(self) -> None:
+        """持久化圖表歷史資料，避免重啟後圖表歸零。"""
+        os.makedirs(os.path.dirname(os.path.abspath(HISTORY_FILE)), exist_ok=True)
+        payload = {
+            "score_history": self.score_history,
+            "tile_history": self.tile_history,
+            "weights_history": self.weights_history,
+        }
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    def _start_episode_policy(self) -> None:
+        """
+        決定新回合策略：
+        - 探索回合：使用擾動權重（供 ES 估計梯度）
+        - 利用回合：使用基準權重（提升即時勝率）
+        """
+        self._episode_exploring = random.random() < self.exploration_rate
+        if self._episode_exploring:
+            self._noise = {k: random.gauss(0, self.sigma) for k in self.base_weights}
+            self.weights = {k: max(0.05, self.base_weights[k] + self._noise[k]) for k in self.base_weights}
+            return
+
+        # 利用回合不加噪聲，避免探索噪聲拖累實戰勝率
+        self._noise = {k: 0.0 for k in self.base_weights}
+        self.weights = self.base_weights.copy()
 
     def _compute_reward(self, score: int, max_tile: int) -> float:
         """
-        對數尺度獎勵 + 強化里程碑，讓 2048→4096→8192 的推力逐級增強。
+        對數尺度獎勵 + 里程碑獎勵/懲罰：
+        - 高里程碑（>=1024）給正向推力
+        - 低里程碑（<1024）給負向懲罰，避免模型停留在低品質策略
         """
         log_score = math.log1p(score)
         if max_tile >= 8192:
@@ -102,9 +179,13 @@ class HeuristicExpectimaxAI:
         elif max_tile >= 1024:
             milestone = 6.0
         elif max_tile >= 512:
-            milestone = 3.0
+            milestone = -1.0
+        elif max_tile >= 256:
+            milestone = -3.0
+        elif max_tile >= 128:
+            milestone = -6.0
         else:
-            milestone = 0.0
+            milestone = -10.0
         return log_score + milestone
 
     def on_episode_end(self, score: int, max_tile: int) -> float:
@@ -117,16 +198,20 @@ class HeuristicExpectimaxAI:
         # 更新基準線（EMA）
         self.baseline = (1 - self.baseline_alpha) * self.baseline + self.baseline_alpha * reward
 
-        # 累積本局資料
-        self._episode_buffer.append((reward, self._noise.copy()))
+        # 只用探索回合資料更新 ES，避免利用回合（零噪聲）稀釋梯度
+        if self._episode_exploring:
+            self._episode_buffer.append((reward, self._noise.copy()))
+
         self.episode_count += 1
-        self._apply_perturbation()
+        self.exploration_rate = max(MIN_EXPLORATION_RATE, self.exploration_rate * EXPLORATION_DECAY)
+        self._start_episode_policy()
 
         # 記錄歷史（供圖表觀察）
         self.score_history.append(score)
         self.tile_history.append(max_tile)
+        self._save_history()
 
-        # 批次更新
+        # 批次更新（以探索回合數量計）
         if len(self._episode_buffer) >= BATCH_SIZE:
             self._batch_update()
             self._episode_buffer = []
@@ -156,6 +241,7 @@ class HeuristicExpectimaxAI:
 
         # 批次更新完成後快照一次權重（供圖表觀察）
         self.weights_history.append(self.base_weights.copy())
+        self._save_history()
 
     def choose_move(self, board: Board) -> Tuple[Optional[Direction], Dict[Direction, float]]:
         # 對每個方向執行 Expectimax，選出評估分最高的移動
@@ -217,6 +303,7 @@ class HeuristicExpectimaxAI:
         monotonicity = self._monotonicity(board)
         merge_potential = self._merge_potential(board)
         snake = self._snake_score(board)
+        snake_penalty = self._snake_violation_penalty(board)
         corner = self._corner_anchor(board, max_tile)
         danger = self._danger_penalty(empties)
 
@@ -226,6 +313,7 @@ class HeuristicExpectimaxAI:
             + self.weights["merge_potential"] * merge_potential
             + self.weights["max_tile"] * (max_tile.bit_length() - 1 if max_tile > 0 else 0)
             + self.weights["snake"] * snake
+            + SNAKE_VIOLATION_COEF * snake_penalty
             + self.weights["corner"] * corner
             + danger  # 危機懲罰不參與 ES 學習，固定套用
         )
@@ -267,6 +355,21 @@ class HeuristicExpectimaxAI:
                 if board[r][c] > 0:
                     score += math.log2(board[r][c]) * SNAKE_WEIGHTS[r][c]
         return score / SNAKE_WEIGHT_SUM
+
+    def _snake_violation_penalty(self, board: Board) -> float:
+        """
+        蛇行違規懲罰：沿蛇行路徑取出非零序列，若後一格大於前一格則扣分。
+        回傳非正值；數值越小代表越偏離蛇行遞減隊形。
+        """
+        seq = [board[r][c] for r, c in SNAKE_PATH if board[r][c] > 0]
+        if len(seq) < 2:
+            return 0.0
+
+        penalty = 0.0
+        for prev, curr in zip(seq, seq[1:]):
+            if curr > prev:
+                penalty += math.log2(curr) - math.log2(prev)
+        return -penalty
 
     def _corner_anchor(self, board: Board, max_tile: int) -> float:
         """

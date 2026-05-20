@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .ai import HeuristicExpectimaxAI
 
+from .ai import BATCH_SIZE
+
 import matplotlib
 import matplotlib.ticker
 import matplotlib.patches as mpatches
@@ -225,7 +227,7 @@ class ChartWindow:
         wh = self.ai.weights_history
         if not wh:
             self._empty_plot(self._fig_weights, self._cv_weights,
-                             "尚無數據（每 5 局批次更新一次）")
+                             f"尚無數據（每 {BATCH_SIZE} 個探索回合批次更新一次）")
             return
 
         keys = list(wh[0].keys())
@@ -242,7 +244,7 @@ class ChartWindow:
                     linewidth=1.6, color=palette[i % len(palette)], label=k)
 
         ax.axhline(y=0.05, color="#bbb", linestyle="--", linewidth=0.8)
-        ax.set_xlabel("批次（每 5 局）", fontsize=9)
+        ax.set_xlabel(f"批次（每 {BATCH_SIZE} 個探索回合）", fontsize=9)
         ax.set_ylabel("權重值", fontsize=9)
         ax.legend(fontsize=8, loc="upper right")
 
