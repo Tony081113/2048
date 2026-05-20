@@ -46,9 +46,15 @@ class GameGUI:
         self.ai_games = 0      # AI 累計局數
         self.ai_wins = 0       # AI 達到 2048 的次數
         self.best_ai_tile = 0  # AI 出現過的最高方塊值
+        self.current_episode_steps = 0  # 當前 AI 回合步數
+        self.current_episode_stability_sum = 0.0  # 當前回合蛇行穩定度累計
+        self.current_episode_stability_count = 0  # 當前回合蛇行穩定度樣本數
+        self.last_episode_snake_stability = 0.0   # 上一局平均蛇行穩定度
+        self.live_snake_stability = 0.0           # 目前盤面的即時蛇行穩定度
         self.last_values: Dict[str, float] = {}  # 上一步各方向評估分數
 
         self.delay_ms = tk.IntVar(value=200)  # AI 每步延遲（毫秒）
+        self.use_gpu_var = tk.BooleanVar(value=self.ai.use_gpu)
         self.ai_running = False
         self._fullscreen = False  # 真正全螢幕狀態（F11 切換）
         self._chart_win: Optional["ChartWindow"] = None  # 圖表視窗參考
@@ -122,6 +128,20 @@ class GameGUI:
         self.max_tile_label = tk.Label(right, text="AI 最高方塊: 0", bg="#f3eee6", anchor="w")
         self.max_tile_label.pack(fill="x", padx=10)
 
+        self.backend_label = tk.Label(right, text=f"運算後端: {self.ai.backend_summary}", bg="#f3eee6", anchor="w", justify="left", wraplength=250)
+        self.backend_label.pack(fill="x", padx=10, pady=(4, 0))
+
+        self.gpu_toggle = tk.Checkbutton(
+            right,
+            text="使用 GPU 評估 (G)",
+            variable=self.use_gpu_var,
+            command=self.toggle_gpu,
+            bg="#f3eee6",
+            activebackground="#f3eee6",
+            anchor="w",
+        )
+        self.gpu_toggle.pack(fill="x", padx=10, pady=(4, 0))
+
         tk.Label(right, text="決策權重（已學習）", font=("Arial", 10, "bold"), bg="#f3eee6").pack(anchor="w", padx=10, pady=(10, 4))
         self.weights_label = tk.Label(right, bg="#f3eee6", justify="left", anchor="w")
         self.weights_label.pack(fill="x", padx=10)
@@ -133,6 +153,10 @@ class GameGUI:
         self.last_reward_label.pack(fill="x", padx=10)
         self.learn_ep_label = tk.Label(right, text="訓練局數: 0", bg="#f3eee6", anchor="w")
         self.learn_ep_label.pack(fill="x", padx=10)
+        self.live_snake_label = tk.Label(right, text="蛇行穩定度(即時): 0.00", bg="#f3eee6", anchor="w")
+        self.live_snake_label.pack(fill="x", padx=10)
+        self.last_snake_label = tk.Label(right, text="蛇行穩定度(上局): 0.00", bg="#f3eee6", anchor="w")
+        self.last_snake_label.pack(fill="x", padx=10)
 
         tk.Label(right, text="上次移動分數", font=("Arial", 10, "bold"), bg="#f3eee6").pack(anchor="w", padx=10, pady=(10, 4))
         self.values_label = tk.Label(right, bg="#f3eee6", justify="left", anchor="w")
@@ -152,7 +176,7 @@ class GameGUI:
         )
         self.speed_scale.pack(padx=10, pady=(0, 10))
 
-        tk.Label(right, text="快捷鍵: 方向鍵=移動, M=模式\n+/-=速度, C=圖表, F11=全螢幕", bg="#f3eee6", fg="#555", justify="left").pack(
+        tk.Label(right, text="快捷鍵: 方向鍵=移動, M=模式\n+/-=速度, C=圖表, G=GPU, F11=全螢幕", bg="#f3eee6", fg="#555", justify="left").pack(
             anchor="w", padx=10, pady=(0, 10)
         )
 
@@ -168,6 +192,8 @@ class GameGUI:
         self.root.bind_all("R", lambda _e: self.restart_game())
         self.root.bind_all("c", lambda _e: self.open_charts())
         self.root.bind_all("C", lambda _e: self.open_charts())
+        self.root.bind_all("g", lambda _e: self.toggle_gpu())
+        self.root.bind_all("G", lambda _e: self.toggle_gpu())
         # + 鍵加速（含數字鍵盤）
         self.root.bind_all("+", lambda _e: self.adjust_speed(-20))
         self.root.bind_all("=", lambda _e: self.adjust_speed(-20))
@@ -200,6 +226,10 @@ class GameGUI:
     def restart_game(self) -> None:
         # 重置遊戲狀態與上次評估值
         self.game.reset()
+        self.current_episode_steps = 0
+        self.current_episode_stability_sum = 0.0
+        self.current_episode_stability_count = 0
+        self.live_snake_stability = self.ai.snake_stability(self.game.board)
         self.last_values = {}
         self.draw()
 
@@ -234,6 +264,11 @@ class GameGUI:
             self._chart_win.win.focus_force()
             self._chart_win.refresh()
 
+    def toggle_gpu(self) -> None:
+        self.ai.set_gpu_enabled(bool(self.use_gpu_var.get()))
+        self.use_gpu_var.set(self.ai.use_gpu)
+        self.draw()
+
     def manual_move(self, direction: Direction) -> None:
         # 手動模式下處理玩家移動
         if self.mode.get() != "手動":
@@ -255,7 +290,13 @@ class GameGUI:
         move, values = self.ai.choose_move(self.game.board)
         self.last_values = values
         if move is not None:
-            self.game.move(move)
+            moved = self.game.move(move)
+            if moved:
+                self.current_episode_steps += 1
+                stability = self.ai.snake_stability(self.game.board)
+                self.live_snake_stability = stability
+                self.current_episode_stability_sum += stability
+                self.current_episode_stability_count += 1
 
         if not self.game.can_move():
             self.finish_ai_episode()
@@ -273,8 +314,17 @@ class GameGUI:
             self.ai_wins += 1
 
         # 將本局分數與最高方塊回饋給 AI 學習（獎懲機制）
-        self.ai.on_episode_end(self.game.score, tile)
+        self.ai.on_episode_end(self.game.score, tile, steps=self.current_episode_steps)
         self.episode = self.ai.episode_count
+        if self.current_episode_stability_count > 0:
+            self.last_episode_snake_stability = (
+                self.current_episode_stability_sum / self.current_episode_stability_count
+            )
+        else:
+            self.last_episode_snake_stability = self.ai.snake_stability(self.game.board)
+        self.current_episode_steps = 0
+        self.current_episode_stability_sum = 0.0
+        self.current_episode_stability_count = 0
 
     def draw(self) -> None:
         # 更新所有 UI 標籤與棋盤繪製
@@ -286,6 +336,8 @@ class GameGUI:
         win_rate = (self.ai_wins / self.ai_games * 100.0) if self.ai_games else 0.0
         self.winrate_label.configure(text=f"勝率 (>=2048): {win_rate:.2f}%")
         self.max_tile_label.configure(text=f"AI 最高方塊: {self.best_ai_tile}")
+        self.backend_label.configure(text=f"運算後端: {self.ai.backend_summary}")
+        self.use_gpu_var.set(self.ai.use_gpu)
 
         # 顯示已學習的基準權重（非擾動值）
         self.weights_label.configure(text="\n".join([f"{k}: {v:.3f}" for k, v in self.ai.base_weights.items()]))
@@ -294,6 +346,9 @@ class GameGUI:
         self.baseline_label.configure(text=f"基準獎勵: {self.ai.baseline:.2f}")
         self.last_reward_label.configure(text=f"上局獎勵: {self.ai.last_reward:.2f}")
         self.learn_ep_label.configure(text=f"訓練局數: {self.ai.episode_count}")
+        self.live_snake_stability = self.ai.snake_stability(self.game.board)
+        self.live_snake_label.configure(text=f"蛇行穩定度(即時): {self.live_snake_stability:.2f}")
+        self.last_snake_label.configure(text=f"蛇行穩定度(上局): {self.last_episode_snake_stability:.2f}")
 
         # 顯示上次各方向的評估分數
         dir_labels = {"up": "上", "down": "下", "left": "左", "right": "右"}

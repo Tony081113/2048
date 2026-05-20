@@ -4,6 +4,7 @@ import os
 import random
 from typing import Dict, List, Optional, Tuple
 
+from .acceleration import AccelerationBackend, detect_acceleration_backend, load_cupy
 from .core import Board, Direction, Game2048
 
 
@@ -20,13 +21,13 @@ DEFAULT_WEIGHTS = {
     "corner": 1.2,            # 低：不過度守成
 }
 
-# 蛇形梯度權重矩陣（左下角為最高優先位置）
-# [3][0]=15（最大值理想位置）→ 沿蛇形路徑遞減到 [0][3]=0
+# 蛇形梯度權重矩陣（沿 SNAKE_PATH 由高優先到低優先遞減）
+# [3][0]=15（最大值理想位置）→ 沿蛇形路徑遞減到 [0][0]=0
 SNAKE_WEIGHTS = [
-    [ 3,  2,  1,  0],   # 第 0 列（遠離角落，低優先）
-    [ 4,  5,  6,  7],   # 第 1 列
-    [11, 10,  9,  8],   # 第 2 列
-    [12, 13, 14, 15],   # 第 3 列（最接近左下角，高優先）
+    [ 0,  1,  2,  3],   # 第 0 列（遠離角落，低優先）
+    [ 7,  6,  5,  4],   # 第 1 列
+    [ 8,  9, 10, 11],   # 第 2 列
+    [15, 14, 13, 12],   # 第 3 列（最接近左下角，高優先）
 ]
 SNAKE_WEIGHT_SUM = 120  # 所有權重總和，用於正規化
 
@@ -38,6 +39,11 @@ SNAKE_PATH = [
     (0, 3), (0, 2), (0, 1), (0, 0),
 ]
 SNAKE_VIOLATION_COEF = 2.0
+LATE_GAME_SNAKE_GUARD_COEF = 2.0
+LATE_GAME_GUARD_TILE = 512
+ANCHOR_BREAK_PENALTY = 18.0
+STABILITY_DROP_PENALTY_COEF = 14.0
+CRITICAL_EMPTY_CELLS = 4
 
 # 機率節點最多採樣幾個空格（限制分支數，維持深度 4 的速度）
 MAX_CHANCE_CELLS = 6
@@ -50,11 +56,21 @@ INITIAL_EXPLORATION_RATE = 0.35
 MIN_EXPLORATION_RATE = 0.08
 EXPLORATION_DECAY = 0.995
 
+# 每一步的固定懲罰係數（預設關閉；可由建構子覆寫）
+DEFAULT_STEP_PENALTY = 0.0
+SNAKE_PATH_ROWS = [r for r, _ in SNAKE_PATH]
+SNAKE_PATH_COLS = [c for _, c in SNAKE_PATH]
+
 
 class HeuristicExpectimaxAI:
-    def __init__(self, game: Game2048, depth: int = 4) -> None:
+    def __init__(self, game: Game2048, depth: int = 4, step_penalty: float = DEFAULT_STEP_PENALTY, use_gpu: bool = True) -> None:
         self.game = game
         self.depth = depth
+        self.step_penalty = max(0.0, float(step_penalty))
+        self.use_gpu = bool(use_gpu)
+        self._cupy = None
+        self.backend: AccelerationBackend = AccelerationBackend("CPU", True, True, "初始化中")
+        self._refresh_backend()
 
         # Evolution Strategies 學習超參數
         self.sigma = 0.15          # 每局權重擾動的標準差
@@ -64,6 +80,7 @@ class HeuristicExpectimaxAI:
         # 學習狀態
         self.baseline = 0.0        # 獎勵基準線（EMA）
         self.last_reward = 0.0     # 上一局獎勵（對數域）
+        self.last_steps = 0        # 上一局實際步數
         self.episode_count = 0     # 總訓練局數
         self._noise: Dict[str, float] = {}
         self._episode_exploring = False
@@ -80,6 +97,18 @@ class HeuristicExpectimaxAI:
         self._load_history()
         # 初始化本局決策權重（探索或利用）
         self._start_episode_policy()
+
+    @property
+    def backend_summary(self) -> str:
+        return self.backend.summary
+
+    def _refresh_backend(self) -> None:
+        self._cupy = load_cupy(prefer_gpu=self.use_gpu)
+        self.backend = detect_acceleration_backend(prefer_gpu=self.use_gpu)
+
+    def set_gpu_enabled(self, enabled: bool) -> None:
+        self.use_gpu = bool(enabled)
+        self._refresh_backend()
 
     def _load_weights(self) -> Dict[str, float]:
         """從 JSON 載入已學習的基準權重；若值域異常（舊版暴衝）則重置"""
@@ -163,7 +192,7 @@ class HeuristicExpectimaxAI:
         self._noise = {k: 0.0 for k in self.base_weights}
         self.weights = self.base_weights.copy()
 
-    def _compute_reward(self, score: int, max_tile: int) -> float:
+    def _compute_reward(self, score: int, max_tile: int, steps: int = 0) -> float:
         """
         對數尺度獎勵 + 里程碑獎勵/懲罰：
         - 高里程碑（>=1024）給正向推力
@@ -186,14 +215,32 @@ class HeuristicExpectimaxAI:
             milestone = -6.0
         else:
             milestone = -10.0
-        return log_score + milestone
+        step_cost = self._adaptive_step_penalty(max_tile) * max(0, int(steps))
+        return log_score + milestone - step_cost
 
-    def on_episode_end(self, score: int, max_tile: int) -> float:
+    def _adaptive_step_penalty(self, max_tile: int) -> float:
+        """
+        自適應步數懲罰：
+        - 前期可施加完整步數壓力，避免無效拖步
+        - 中後期逐步放鬆，避免為了省步數而破壞蛇行主架構
+        """
+        if self.step_penalty <= 0.0:
+            return 0.0
+        if max_tile >= 1024:
+            return 0.0
+        if max_tile >= 512:
+            return 0.0
+        if max_tile >= 256:
+            return self.step_penalty * 0.35
+        return self.step_penalty
+
+    def on_episode_end(self, score: int, max_tile: int, steps: int = 0) -> float:
         """
         每局結束後累積到 buffer，滿 BATCH_SIZE 局再做批次正規化梯度更新。
         """
-        reward = self._compute_reward(score, max_tile)
+        reward = self._compute_reward(score, max_tile, steps)
         self.last_reward = reward
+        self.last_steps = max(0, int(steps))
 
         # 更新基準線（EMA）
         self.baseline = (1 - self.baseline_alpha) * self.baseline + self.baseline_alpha * reward
@@ -239,6 +286,10 @@ class HeuristicExpectimaxAI:
             grad = max(-1.0, min(1.0, grad))       # 梯度截斷
             self.base_weights[k] = max(0.05, min(20.0, self.base_weights[k] + self.lr * grad))
 
+        # 維持核心策略下限，避免學習過程過度貪分導致蛇行崩解
+        self.base_weights["snake"] = max(1.5, self.base_weights["snake"])
+        self.base_weights["corner"] = max(1.0, self.base_weights["corner"])
+
         # 批次更新完成後快照一次權重（供圖表觀察）
         self.weights_history.append(self.base_weights.copy())
         self._save_history()
@@ -249,6 +300,7 @@ class HeuristicExpectimaxAI:
         best_move: Optional[Direction] = None
         best_value = float("-inf")
         values: Dict[Direction, float] = {}
+        search_depth = self._effective_depth(board)
 
         for direction in ("up", "down", "left", "right"):
             result = self.game.simulate_move(board, direction)
@@ -256,7 +308,8 @@ class HeuristicExpectimaxAI:
                 values[direction] = float("-inf")
                 continue
             immediate = math.log1p(result.score_gained) if result.score_gained > 0 else 0.0
-            value = immediate + self.expectimax(result.board, self.depth - 1, is_chance=True)
+            guard = self._late_game_move_guard(board, result.board)
+            value = immediate + guard + self.expectimax(result.board, search_depth - 1, is_chance=True)
             values[direction] = value
             if value > best_value:
                 best_value = value
@@ -293,17 +346,27 @@ class HeuristicExpectimaxAI:
             if not result.moved:
                 continue
             immediate = math.log1p(result.score_gained) if result.score_gained > 0 else 0.0
-            best = max(best, immediate + self.expectimax(result.board, depth - 1, True))
+            guard = self._late_game_move_guard(board, result.board)
+            best = max(best, immediate + guard + self.expectimax(result.board, depth - 1, True))
         return best if best != float("-inf") else self.evaluate(board)
 
     def evaluate(self, board: Board) -> float:
         # 綜合評估棋盤狀態，回傳加權分數
+        if self._cupy is not None and self.backend.name == "CuPy" and self.backend.active:
+            return self._evaluate_gpu(board)
+
+        return self._evaluate_cpu(board)
+
+    def _evaluate_cpu(self, board: Board) -> float:
+        # CPU 路徑：保留原本啟發式評估
+
         empties = len(self.game.empty_cells(board))
         max_tile = self.game.max_tile(board)
         monotonicity = self._monotonicity(board)
         merge_potential = self._merge_potential(board)
         snake = self._snake_score(board)
         snake_penalty = self._snake_violation_penalty(board)
+        snake_guard = self._late_game_snake_guard(max_tile, empties)
         corner = self._corner_anchor(board, max_tile)
         danger = self._danger_penalty(empties)
 
@@ -313,10 +376,124 @@ class HeuristicExpectimaxAI:
             + self.weights["merge_potential"] * merge_potential
             + self.weights["max_tile"] * (max_tile.bit_length() - 1 if max_tile > 0 else 0)
             + self.weights["snake"] * snake
-            + SNAKE_VIOLATION_COEF * snake_penalty
+            + (SNAKE_VIOLATION_COEF + snake_guard) * snake_penalty
             + self.weights["corner"] * corner
             + danger  # 危機懲罰不參與 ES 學習，固定套用
         )
+
+    def _evaluate_gpu(self, board: Board) -> float:
+        cp = self._cupy
+        if cp is None:
+            return self._evaluate_cpu(board)
+
+        gpu_board = cp.asarray(board, dtype=cp.float32)
+        log_board = cp.where(gpu_board > 0, cp.log2(gpu_board), 0.0)
+
+        empties = int(cp.count_nonzero(gpu_board == 0).item())
+        max_tile = int(cp.max(gpu_board).item())
+
+        monotonicity = float(
+            (
+                -cp.sum(cp.abs(gpu_board[:, :-1] - gpu_board[:, 1:]))
+                -cp.sum(cp.abs(gpu_board[:-1, :] - gpu_board[1:, :]))
+            ).item()
+            / 1024.0
+        )
+
+        merge_potential = float(
+            (
+                cp.count_nonzero((gpu_board[:, :-1] == gpu_board[:, 1:]) & (gpu_board[:, :-1] > 0))
+                + cp.count_nonzero((gpu_board[:-1, :] == gpu_board[1:, :]) & (gpu_board[:-1, :] > 0))
+            ).item()
+        )
+
+        snake_weights = cp.asarray(SNAKE_WEIGHTS, dtype=cp.float32)
+        snake = float(cp.sum(log_board * snake_weights).item() / SNAKE_WEIGHT_SUM)
+
+        path_values = gpu_board[SNAKE_PATH_ROWS, SNAKE_PATH_COLS]
+        non_zero = path_values[path_values > 0]
+        if int(non_zero.size) < 2:
+            snake_penalty = 0.0
+        else:
+            non_zero_logs = cp.log2(non_zero)
+            diffs = non_zero_logs[1:] - non_zero_logs[:-1]
+            snake_penalty = -float(cp.sum(cp.where(diffs > 0, diffs, 0)).item())
+
+        snake_guard = self._late_game_snake_guard(max_tile, empties)
+        corner = self._corner_anchor(board, max_tile)
+        danger = self._danger_penalty(empties)
+
+        return (
+            self.weights["empty_cells"] * empties
+            + self.weights["monotonicity"] * monotonicity
+            + self.weights["merge_potential"] * merge_potential
+            + self.weights["max_tile"] * (max_tile.bit_length() - 1 if max_tile > 0 else 0)
+            + self.weights["snake"] * snake
+            + (SNAKE_VIOLATION_COEF + snake_guard) * snake_penalty
+            + self.weights["corner"] * corner
+            + danger
+        )
+
+    def _late_game_snake_guard(self, max_tile: int, empties: int) -> float:
+        """
+        後期蛇行守護：盤面進入中後期且空格變少時，
+        逐步放大蛇行違規懲罰，降低「急著合併」造成的隊形破壞。
+        """
+        guard = 0.0
+        if max_tile >= 512:
+            guard += LATE_GAME_SNAKE_GUARD_COEF
+        if empties <= 4:
+            guard += 1.0
+        return guard
+
+    def _late_game_move_guard(self, prev_board: Board, next_board: Board) -> float:
+        """
+        後期移動護欄：
+        - 大磚期（>=512）避免把最大磚從左下角錨點拉走
+        - 空格緊張時重罰蛇行穩定度大幅下降的走法
+        回傳非正值；數值越小代表風險越高。
+        """
+        prev_max = self.game.max_tile(prev_board)
+        if prev_max < LATE_GAME_GUARD_TILE:
+            return 0.0
+
+        penalty = 0.0
+        prev_anchor = prev_board[3][0] == prev_max
+        next_max = self.game.max_tile(next_board)
+        next_anchor = next_board[3][0] == next_max
+
+        if prev_anchor and not next_anchor:
+            penalty -= ANCHOR_BREAK_PENALTY
+
+        prev_stability = self.snake_stability(prev_board)
+        next_stability = self.snake_stability(next_board)
+        stability_drop = max(0.0, prev_stability - next_stability)
+        empties = len(self.game.empty_cells(next_board))
+
+        if empties <= CRITICAL_EMPTY_CELLS and stability_drop > 0.0:
+            penalty -= STABILITY_DROP_PENALTY_COEF * stability_drop
+
+        if empties <= 2 and next_stability < 0.45:
+            penalty -= 6.0
+
+        return penalty
+
+    def _effective_depth(self, board: Board) -> int:
+        """
+        後期動態加深搜尋：
+        - 基本使用設定深度
+        - 中後期且空格少時，加深 1~2 層降低短視錯判
+        """
+        depth = self.depth
+        max_tile = self.game.max_tile(board)
+        empties = len(self.game.empty_cells(board))
+
+        if max_tile >= 512 and empties <= 6:
+            depth += 1
+        if max_tile >= 1024 and empties <= 4:
+            depth += 1
+
+        return min(6, depth)
 
     def _monotonicity(self, board: Board) -> float:
         # 計算棋盤單調性：相鄰格差值越小越好
@@ -400,3 +577,12 @@ class HeuristicExpectimaxAI:
         if empties <= 4:
             return -5.0
         return 0.0
+
+    def snake_stability(self, board: Board) -> float:
+        """
+        回傳蛇行穩定度（0~1）：
+        - 1.0 代表幾乎沒有蛇行違規
+        - 越接近 0 代表隊形越混亂
+        """
+        violation = -self._snake_violation_penalty(board)
+        return 1.0 / (1.0 + max(0.0, violation))
